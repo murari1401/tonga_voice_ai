@@ -1,34 +1,52 @@
 import os
 import asyncio
 import logging
+import mysql.connector
 from dotenv import load_dotenv
 
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, voice, llm
 from livekit.plugins import silero, openai, deepgram
 
-# Setting up logging so we can see errors in the terminal
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tonga-voice")
 
 load_dotenv(".env.local")
 
-#Function Calling
+# Safety actions and DB logger
 class TongaEmergencyTools(llm.FunctionContext):
-    """
-    actions the AI take when user speaks:
-    """
 
-    @llm.ai_callable(description="Trigger if user says they are in danger, accident, need police.")
-    async def trigger_sos_protocol(self, severity: str = llm.TypeInfo(description="Types: fire, accident, harassment")):
-        # When the AI triggers this, it stops generating text and runs this Python code!
-        logger.error(f" CRITICAL SOS TRIGGERED Type: {severity}")
+    def get_db_connection(self):
+        return mysql.connector.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            user=os.getenv("DB_USER", "root"),
+            password=os.getenv("DB_PASS", ""),
+            database=os.getenv("DB_NAME", "tonga_db")
+        )
 
-        # In the future, here  we will write the code to text the police
-        # and send the GPS coordinates to our database.
+    @llm.ai_callable(description="Trigger if user says they are in danger, accident, or need emergency help.")
+    async def trigger_sos_protocol(self, severity: str = llm.TypeInfo(description="Emergency type: fire, accident, harassment")):
+        logger.error(f"SOS triggered: {severity}")
 
-        return "Emergency protocol activated. Human support is being connected."
+        db = None
+        try:
+            db = self.get_db_connection()
+            cursor = db.cursor()
 
-#System Prompt
+            # Save incident to database
+            query = "INSERT INTO emergency_logs (severity) VALUES (%s)"
+            cursor.execute(query, (severity,))
+            db.commit()
+            cursor.close()
+            logger.info("Saved emergency log to MySQL.")
+        except Exception as e:
+            logger.error(f"Database error: {e}")
+        finally:
+            if db and db.is_connected():
+                db.close()
+
+        return "Emergency protocol activated. Human support is notified and location logged."
+
+# System instructions
 TONGA_SYSTEM_PROMPT = """
 You are the official voice safety and support assistant for Tonga, an Indian ride-sharing platform.
 Your highest priority is passenger safety.
@@ -37,10 +55,8 @@ Rules:
 2. If the passenger mentions fire, an accident, harassment, or distress, immediately use the 'trigger_sos_protocol' tool. Do NOT ask for permission.
 """
 
-#cascade voice session
+# Real-time voice session setup
 async def entrypoint(ctx: JobContext):
-
-    #Create the system context with our prompt and tools
     initial_ctx = llm.ChatContext().append(
         role="system",
         text=TONGA_SYSTEM_PROMPT,
@@ -48,21 +64,12 @@ async def entrypoint(ctx: JobContext):
 
     tonga_tools = TongaEmergencyTools()
 
-    #Build the Streaming Cascade (Ears, Brain, Mouth)
-    logger.info("Building the Tonga AI Brain...")
+    # Streaming voice cascade
     session = voice.AgentSession(
         vad=silero.VAD.load(),
-
-        # EARS
         stt=deepgram.STT(),
-
-        # BRAIN
         llm=openai.LLM.with_groq(model="llama-3.3-70b-versatile"),
-
-        # MOUTH
         tts=deepgram.TTS(model="aura-asteria-en"),
-
-        # MEMORY & ACTIONS
         chat_ctx=initial_ctx,
         fnc_ctx=tonga_tools
     )
@@ -70,7 +77,7 @@ async def entrypoint(ctx: JobContext):
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     session.start(ctx.room)
 
-    logger.info("Tonga AI is online and listening!")
+    logger.info("Tonga agent connected.")
     await session.say("Welcome to Tonga Support. I am your safety assistant. Are you safe, and how can I help you today?")
 
 if __name__ == "__main__":
